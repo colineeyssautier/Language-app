@@ -20,7 +20,9 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -52,6 +54,8 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 TALLY_SIGNING_SECRET = os.environ.get("TALLY_SIGNING_SECRET", "")
 # Mot de passe des pages web (indispensable une fois l'app en ligne). Vide = pas de mot de passe.
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+# Base Postgres en ligne (Supabase). Vide = fichier SQLite local (DB_PATH).
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "words.db"))
 PORT = int(os.environ.get("PORT", "8000"))
 # Voix ElevenLabs (optionnel : sans clé, les cartes n'ont simplement pas d'audio).
@@ -67,33 +71,148 @@ CONTEXT_LABELS = {"contexte", "context", "note"}
 
 # ---------- Base de données ----------
 
+class DB:
+    """Connexion SQLite (local) ou Postgres (Supabase), avec la même syntaxe « ? » partout."""
+
+    def __init__(self):
+        self.pg = bool(DATABASE_URL)
+        if self.pg:
+            import psycopg  # installé par requirements.txt ; inutile en local
+            from psycopg.rows import dict_row
+            # prepare_threshold=None : compatible avec le « pooler » de Supabase
+            self.conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
+        else:
+            self.conn = sqlite3.connect(DB_PATH)
+            self.conn.row_factory = sqlite3.Row
+
+    def execute(self, sql, params=()):
+        if self.pg:
+            sql = sql.replace("?", "%s")
+        return self.conn.execute(sql, params)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_):
+        if exc_type:
+            self.conn.rollback()
+        else:
+            self.conn.commit()
+        self.conn.close()
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DB()
+
+
+def is_duplicate(exc):
+    return isinstance(exc, sqlite3.IntegrityError) or type(exc).__name__ == "UniqueViolation"
 
 
 def init_db():
     with db() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                word TEXT NOT NULL,
-                context TEXT,
-                sentence_fr TEXT,
-                word_en TEXT,
-                sentence_en TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                error TEXT,
-                tally_response_id TEXT UNIQUE,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )"""
-        )
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(cards)")}
-        for col in ("audio_word", "audio_sentence"):  # ajoutées avec la voix ElevenLabs
-            if col not in cols:
-                conn.execute(f"ALTER TABLE cards ADD COLUMN {col} TEXT")
-    os.makedirs(AUDIO_DIR, exist_ok=True)
+        if conn.pg:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS cards (
+                    id BIGSERIAL PRIMARY KEY,
+                    word TEXT NOT NULL,
+                    context TEXT,
+                    sentence_fr TEXT,
+                    word_en TEXT,
+                    sentence_en TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    tally_response_id TEXT UNIQUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    audio_word TEXT,
+                    audio_sentence TEXT
+                )"""
+            )
+            conn.execute("CREATE TABLE IF NOT EXISTS audio (name TEXT PRIMARY KEY, data BYTEA NOT NULL)")
+        else:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS cards (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    word TEXT NOT NULL,
+                    context TEXT,
+                    sentence_fr TEXT,
+                    word_en TEXT,
+                    sentence_en TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    tally_response_id TEXT UNIQUE,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(cards)")}
+            for col in ("audio_word", "audio_sentence"):  # ajoutées avec la voix ElevenLabs
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE cards ADD COLUMN {col} TEXT")
+            conn.execute("CREATE TABLE IF NOT EXISTS audio (name TEXT PRIMARY KEY, data BLOB NOT NULL)")
+            # Anciennes versions : les mp3 étaient dans le dossier audio/, on les range dans la base.
+            if os.path.isdir(AUDIO_DIR):
+                for name in os.listdir(AUDIO_DIR):
+                    if name.endswith(".mp3"):
+                        with open(os.path.join(AUDIO_DIR, name), "rb") as f:
+                            conn.execute("INSERT OR IGNORE INTO audio (name, data) VALUES (?, ?)",
+                                         (name, f.read()))
+
+
+def put_audio(name, data):
+    with db() as conn:
+        conn.execute("DELETE FROM audio WHERE name = ?", (name,))
+        conn.execute("INSERT INTO audio (name, data) VALUES (?, ?)", (name, data))
+
+
+def get_audio(name):
+    with db() as conn:
+        row = conn.execute("SELECT data FROM audio WHERE name = ?", (name,)).fetchone()
+    return bytes(row["data"]) if row else None
+
+
+def copy_local_to_online():
+    """`python app.py copier` : envoie les mots et audios de words.db vers la base en ligne.
+
+    À lancer une fois, avant d'ajouter des mots en ligne."""
+    if not DATABASE_URL:
+        raise SystemExit("Ajoute d'abord DATABASE_URL (Supabase) dans ton fichier .env.")
+    init_db()
+    local = sqlite3.connect(DB_PATH)
+    local.row_factory = sqlite3.Row
+    cards = local.execute("SELECT * FROM cards ORDER BY id").fetchall()
+    has_audio_table = local.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audio'").fetchone()
+    audios = {r["name"]: r["data"] for r in local.execute("SELECT * FROM audio")} if has_audio_table else {}
+    if os.path.isdir(AUDIO_DIR):  # mp3 encore dans le dossier audio/
+        for name in os.listdir(AUDIO_DIR):
+            if name.endswith(".mp3") and name not in audios:
+                with open(os.path.join(AUDIO_DIR, name), "rb") as f:
+                    audios[name] = f.read()
+    # On garde les mêmes numéros de carte et noms de mp3 : Anki reconnaîtra les cartes déjà importées.
+    copied, conflicts = 0, []
+    with db() as conn:
+        for r in cards:
+            r = dict(r)
+            existing = conn.execute("SELECT word FROM cards WHERE id = ?", (r["id"],)).fetchone()
+            if existing:
+                if existing["word"] != r["word"]:
+                    conflicts.append(r["word"])
+                continue
+            conn.execute(
+                """INSERT INTO cards (id, word, context, sentence_fr, word_en, sentence_en, status, error,
+                                      audio_word, audio_sentence)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (r["id"], r["word"], r["context"], r["sentence_fr"], r["word_en"], r["sentence_en"],
+                 r["status"], r["error"], r.get("audio_word"), r.get("audio_sentence")))
+            for name in (r.get("audio_word"), r.get("audio_sentence")):
+                if name and name in audios:
+                    conn.execute("INSERT INTO audio (name, data) VALUES (?, ?) ON CONFLICT (name) DO NOTHING",
+                                 (name, audios[name]))
+            copied += 1
+        conn.execute("SELECT setval(pg_get_serial_sequence('cards', 'id'), (SELECT COALESCE(MAX(id), 1) FROM cards))")
+    if conflicts:
+        print("⚠️  Non copiés (la base en ligne a déjà une autre carte au même numéro) :", ", ".join(conflicts))
+    print(f"{copied} carte(s) copiée(s) vers la base en ligne.")
 
 
 # ---------- Groq ----------
@@ -178,13 +297,14 @@ def add_word(word, context="", tally_response_id=None):
     context = (context or "").strip()
     with db() as conn:
         try:
-            cur = conn.execute(
-                "INSERT INTO cards (word, context, tally_response_id) VALUES (?, ?, ?)",
+            card_id = conn.execute(
+                "INSERT INTO cards (word, context, tally_response_id) VALUES (?, ?, ?) RETURNING id",
                 (word, context, tally_response_id),
-            )
-        except sqlite3.IntegrityError:
-            return None  # Tally a renvoyé la même soumission : on l'ignore.
-        card_id = cur.lastrowid
+            ).fetchone()["id"]
+        except Exception as e:
+            if is_duplicate(e):
+                return None  # Tally a renvoyé la même soumission : on l'ignore.
+            raise
     process_card(card_id)
     return card_id
 
@@ -256,8 +376,7 @@ def save_audio(text, filename):
         f"/text-to-speech/{voice_id()}?output_format=mp3_44100_128",
         {"text": text, "model_id": ELEVENLABS_MODEL},
     )
-    with open(os.path.join(AUDIO_DIR, filename), "wb") as f:
-        f.write(audio)
+    put_audio(filename, audio)
     return filename
 
 
@@ -361,8 +480,9 @@ def export_audio_zip():
     with zipfile.ZipFile(buf, "w") as z:
         for r in done_cards():
             for name in (r["audio_word"], r["audio_sentence"]):
-                if name and os.path.exists(os.path.join(AUDIO_DIR, name)):
-                    z.write(os.path.join(AUDIO_DIR, name), name)
+                data = get_audio(name) if name else None
+                if data:
+                    z.writestr(name, data)
     return buf.getvalue()
 
 
@@ -378,24 +498,27 @@ def export_apkg():
     )
     deck = genanki.Deck(2059400110, "Français")
     media = []
+    tmpdir = tempfile.mkdtemp()  # genanki lit les sons depuis des fichiers
     for r in done_cards():
         front, back = front_back(r)
         # guid stable : réimporter le paquet met à jour les cartes au lieu de les dupliquer
         deck.add_note(genanki.Note(model=model, fields=[front, back], tags=["francais"],
                                    guid=genanki.guid_for("motsfr", r["id"])))
         for name in (r["audio_word"], r["audio_sentence"]):
-            if name and os.path.exists(os.path.join(AUDIO_DIR, name)):
-                media.append(os.path.join(AUDIO_DIR, name))
+            data = get_audio(name) if name else None
+            if data:
+                with open(os.path.join(tmpdir, name), "wb") as f:
+                    f.write(data)
+                media.append(os.path.join(tmpdir, name))
     package = genanki.Package(deck)
     package.media_files = media
-    with tempfile.NamedTemporaryFile(suffix=".apkg", delete=False) as tmp:
-        path = tmp.name
+    path = os.path.join(tmpdir, "francais.apkg")
     try:
         package.write_to_file(path)
         with open(path, "rb") as f:
             return f.read()
     finally:
-        os.remove(path)
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ---------- Serveur web ----------
@@ -495,11 +618,10 @@ class Handler(BaseHTTPRequestHandler):
                       {"Content-Disposition": 'attachment; filename="audio_francais.zip"'})
         elif path.startswith("/audio/"):
             name = os.path.basename(urllib.parse.unquote(path))
-            file_path = os.path.join(AUDIO_DIR, name)
-            if not name.endswith(".mp3") or not os.path.isfile(file_path):
+            data = get_audio(name) if name.endswith(".mp3") else None
+            if not data:
                 return self.send(404, "Page introuvable")
-            with open(file_path, "rb") as f:
-                self.send(200, f.read(), "audio/mpeg")
+            self.send(200, data, "audio/mpeg")
         else:
             self.send(404, "Page introuvable")
 
@@ -540,10 +662,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["copier"]:
+        copy_local_to_online()
+        raise SystemExit
     init_db()
     if not GROQ_API_KEY:
         print("⚠️  GROQ_API_KEY n'est pas définie : les phrases ne pourront pas être générées.")
     if not ELEVENLABS_API_KEY:
         print("ℹ️  ELEVENLABS_API_KEY n'est pas définie : les cartes seront créées sans audio.")
+    print("Base :", "Supabase (en ligne)" if DATABASE_URL else DB_PATH)
     print(f"App lancée sur http://localhost:{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
