@@ -128,6 +128,8 @@ def init_db():
                     audio_sentence TEXT
                 )"""
             )
+            # exported = 1 quand la carte est déjà partie dans un paquet Anki
+            conn.execute("ALTER TABLE cards ADD COLUMN IF NOT EXISTS exported INTEGER NOT NULL DEFAULT 0")
             conn.execute("CREATE TABLE IF NOT EXISTS audio (name TEXT PRIMARY KEY, data BYTEA NOT NULL)")
         else:
             conn.execute(
@@ -145,9 +147,11 @@ def init_db():
                 )"""
             )
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(cards)")}
-            for col in ("audio_word", "audio_sentence"):  # ajoutées avec la voix ElevenLabs
+            # Colonnes ajoutées après coup (voix ElevenLabs, suivi des cartes déjà exportées).
+            for col, definition in (("audio_word", "TEXT"), ("audio_sentence", "TEXT"),
+                                    ("exported", "INTEGER NOT NULL DEFAULT 0")):
                 if col not in cols:
-                    conn.execute(f"ALTER TABLE cards ADD COLUMN {col} TEXT")
+                    conn.execute(f"ALTER TABLE cards ADD COLUMN {col} {definition}")
             conn.execute("CREATE TABLE IF NOT EXISTS audio (name TEXT PRIMARY KEY, data BLOB NOT NULL)")
             # Anciennes versions : les mp3 étaient dans le dossier audio/, on les range dans la base.
             if os.path.isdir(AUDIO_DIR):
@@ -446,9 +450,29 @@ def parse_tally(payload):
 
 # ---------- Export Anki ----------
 
-def done_cards():
+def done_cards(new_only=False):
+    sql = "SELECT * FROM cards WHERE status='done'" + (" AND exported = 0" if new_only else "")
     with db() as conn:
-        return conn.execute("SELECT * FROM cards WHERE status='done' ORDER BY id").fetchall()
+        return conn.execute(sql + " ORDER BY id").fetchall()
+
+
+def mark_exported(ids):
+    with db() as conn:
+        for card_id in ids:
+            conn.execute("UPDATE cards SET exported = 1 WHERE id = ?", (card_id,))
+
+
+def delete_cards(ids):
+    """Efface les cartes et leurs audios de la base (pas d'Anki)."""
+    with db() as conn:
+        for card_id in ids:
+            row = conn.execute("SELECT audio_word, audio_sentence FROM cards WHERE id = ?", (card_id,)).fetchone()
+            if not row:
+                continue
+            for name in (row["audio_word"], row["audio_sentence"]):
+                if name:
+                    conn.execute("DELETE FROM audio WHERE name = ?", (name,))
+            conn.execute("DELETE FROM cards WHERE id = ?", (card_id,))
 
 
 def sound(filename):
@@ -486,8 +510,10 @@ def export_audio_zip():
     return buf.getvalue()
 
 
-def export_apkg():
-    """Paquet Anki complet (cartes + audio) : un double-clic suffit. Nécessite `pip install genanki`."""
+def export_apkg(new_only=True):
+    """Paquet Anki (cartes + audio) : un double-clic suffit. Nécessite `pip install genanki`.
+
+    Par défaut, seulement les cartes pas encore exportées. Renvoie (contenu, ids des cartes)."""
     import genanki  # importé ici pour que le reste de l'app marche sans
     model = genanki.Model(
         1607392319, "Mots français (audio)",
@@ -499,7 +525,8 @@ def export_apkg():
     deck = genanki.Deck(2059400110, "Français")
     media = []
     tmpdir = tempfile.mkdtemp()  # genanki lit les sons depuis des fichiers
-    for r in done_cards():
+    cards = done_cards(new_only)
+    for r in cards:
         front, back = front_back(r)
         # guid stable : réimporter le paquet met à jour les cartes au lieu de les dupliquer
         deck.add_note(genanki.Note(model=model, fields=[front, back], tags=["francais"],
@@ -516,7 +543,7 @@ def export_apkg():
     try:
         package.write_to_file(path)
         with open(path, "rb") as f:
-            return f.read()
+            return f.read(), [r["id"] for r in cards]
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -531,17 +558,23 @@ body{{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;padding:
 table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid #ddd;padding:.5rem;text-align:left;vertical-align:top}}
 .err{{color:#b00}} a.btn,button{{background:#2a5bd7;color:#fff;border:0;padding:.5rem 1rem;border-radius:6px;text-decoration:none;cursor:pointer}}
 input{{padding:.45rem;border:1px solid #bbb;border-radius:6px}} form{{margin:1rem 0}}
+button.danger{{background:#b3261e}} button.x{{background:none;color:#999;padding:.2rem .4rem;font-size:1.1rem}}
+tr.exported td{{color:#888}} .small{{color:#666;font-size:.9rem}} .tag{{font-size:.75rem;color:#2e7d32}}
 </style></head><body>
 <h1>Mes mots français</h1>
-<p>{count} carte(s) prête(s).
-<a class="btn" href="/export.apkg">Télécharger le paquet Anki (avec audio)</a>
+<p>{download}</p>
+<p class=small>{count} carte(s) au total, dont {exported} déjà téléchargée(s).
+<a href="/export.apkg?tout=1">Retélécharger toutes les cartes</a> ·
 <a href="/export.csv">CSV</a> · <a href="/audio.zip">fichiers audio (.zip)</a></p>
 <form method="post" action="/add">
 <input name="word" placeholder="mot en français" required>
 <input name="context" placeholder="contexte (optionnel)">
 <button>Ajouter</button></form>
-<form method="post" action="/retry"><button>Réessayer les erreurs / ajouter l'audio manquant</button></form>
-<table><tr><th>Mot</th><th>Phrase</th><th>English</th></tr>{rows}</table>
+<form method="post" action="/retry" style="display:inline"><button>Réessayer les erreurs / ajouter l'audio manquant</button></form>
+<form method="post" action="/delete-exported" style="display:inline"
+ onsubmit="return confirm('Effacer de l’app tous les mots déjà téléchargés ? Ils restent dans Anki.')">
+<button class=danger>Effacer les mots déjà téléchargés</button></form>
+<table><tr><th>Mot</th><th>Phrase</th><th>English</th><th></th></tr>{rows}</table>
 </body></html>"""
 
 
@@ -551,16 +584,28 @@ def render_home():
     e = html.escape
     trs = []
     for r in rows:
+        delete = (f'<form method="post" action="/delete" style="margin:0" '
+                  f'onsubmit="return confirm(\'Effacer ce mot de l’app ?\')">'
+                  f'<input type="hidden" name="id" value="{r["id"]}"><button class=x title="Effacer">✕</button></form>')
         if r["status"] == "done":
             audio = "".join(f'<br><audio controls preload="none" src="/audio/{e(n)}"></audio>'
                             for n in (r["audio_word"], r["audio_sentence"]) if n)
-            trs.append(f"<tr><td><b>{e(r['word'])}</b></td><td>{e(r['sentence_fr'])}{audio}</td>"
-                       f"<td><b>{e(r['word_en'])}</b><br>{e(r['sentence_en'])}</td></tr>")
+            tag = "<br><span class=tag>✓ dans Anki</span>" if r["exported"] else ""
+            trs.append(f"<tr class={'exported' if r['exported'] else 'new'}><td><b>{e(r['word'])}</b>{tag}</td>"
+                       f"<td>{e(r['sentence_fr'])}{audio}</td>"
+                       f"<td><b>{e(r['word_en'])}</b><br>{e(r['sentence_en'])}</td><td>{delete}</td></tr>")
         else:
             msg = e(r["error"] or "en cours…")
-            trs.append(f"<tr><td><b>{e(r['word'])}</b></td><td colspan=2 class=err>{msg}</td></tr>")
-    count = sum(1 for r in rows if r["status"] == "done")
-    return PAGE.format(count=count, rows="".join(trs))
+            trs.append(f"<tr><td><b>{e(r['word'])}</b></td><td colspan=2 class=err>{msg}</td><td>{delete}</td></tr>")
+    done = [r for r in rows if r["status"] == "done"]
+    exported = sum(1 for r in done if r["exported"])
+    new = len(done) - exported
+    if new:
+        download = (f'<a class="btn" href="/export.apkg">Télécharger les {new} nouvelle(s) carte(s) '
+                    f'pour Anki (avec audio)</a>')
+    else:
+        download = "Aucune nouvelle carte à télécharger."
+    return PAGE.format(download=download, count=len(done), exported=exported, rows="".join(trs))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -606,13 +651,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, export_csv().encode("utf-8"), "text/csv; charset=utf-8",
                       {"Content-Disposition": 'attachment; filename="anki_francais.csv"'})
         elif path == "/export.apkg":
+            everything = "tout" in urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
-                data = export_apkg()
+                data, ids = export_apkg(new_only=not everything)
             except ImportError:
                 return self.send(500, "Pour le paquet Anki, installe genanki : python -m pip install genanki",
                                  "text/plain; charset=utf-8")
             self.send(200, data, "application/octet-stream",
                       {"Content-Disposition": 'attachment; filename="francais.apkg"'})
+            mark_exported(ids)  # la prochaine fois, seulement les nouvelles cartes
         elif path == "/audio.zip":
             self.send(200, export_audio_zip(), "application/zip",
                       {"Content-Disposition": 'attachment; filename="audio_francais.zip"'})
@@ -647,6 +694,14 @@ class Handler(BaseHTTPRequestHandler):
             if word.strip():
                 for w, ctx in pair_words(word, form.get("context", [""])[0]):
                     add_word(w, ctx)
+            self.redirect()
+        elif path == "/delete":
+            card_id = urllib.parse.parse_qs(raw.decode()).get("id", [""])[0]
+            if card_id.isdigit():
+                delete_cards([int(card_id)])
+            self.redirect()
+        elif path == "/delete-exported":
+            delete_cards([r["id"] for r in done_cards() if r["exported"]])
             self.redirect()
         elif path == "/retry":
             with db() as conn:
