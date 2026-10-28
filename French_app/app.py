@@ -297,7 +297,7 @@ Mot ou expression en {src} : "{word}"
 Réponds UNIQUEMENT avec un objet JSON contenant :
 - "translation" : la traduction en {dst} du mot (le sens le plus courant, ou celui du contexte donné)
 - "sentence" : une phrase d'exemple naturelle en {src} (niveau B1, 8 à 15 mots) qui utilise ce mot et en montre clairement le sens
-- "sentence_translation" : la traduction complète de cette phrase en {dst}"""
+- "sentence_translation" : la traduction complète de cette phrase en {dst}{spelling_line}"""
 
 PROMPT_AUTO = """Tu aides quelqu'un à apprendre le {a} et le {b}.
 Mot ou expression : "{word}". Il est soit en {a}, soit en {b} : reconnais la langue.
@@ -306,7 +306,22 @@ Réponds UNIQUEMENT avec un objet JSON contenant :
 - "lang" : "{a_code}" si le mot est en {a}, "{b_code}" s'il est en {b}
 - "translation" : la traduction du mot dans l'autre langue (le sens le plus courant, ou celui du contexte donné)
 - "sentence" : une phrase d'exemple naturelle dans la langue du mot (niveau B1, 8 à 15 mots) qui utilise ce mot et en montre clairement le sens
-- "sentence_translation" : la traduction complète de cette phrase dans l'autre langue"""
+- "sentence_translation" : la traduction complète de cette phrase dans l'autre langue{spelling_line}"""
+
+# Le clavier n'a pas les lettres polonaises : on demande à Groq le mot correctement orthographié.
+SPELLING_LINE = """
+- "word" : le mot ou l'expression tel qu'écrit, en ajoutant les signes diacritiques polonais manquants (ą ć ę ł ń ó ś ź ż) s'il est en polonais ; sinon, recopie-le tel quel"""
+
+# Lettres polonaises -> lettres sans accent (ł ne se décompose pas avec unicodedata)
+PL_PLAIN = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
+
+
+def fix_polish_spelling(typed, suggested):
+    """Mot avec ses accents polonais, si Groq n'a changé que les accents ; sinon le mot tapé."""
+    suggested = (suggested or "").strip()
+    if suggested and suggested.translate(PL_PLAIN).lower() == typed.translate(PL_PLAIN).lower():
+        return suggested
+    return typed
 
 
 # Modèles essayés si GROQ_MODEL n'existe plus chez Groq (les modèles changent souvent).
@@ -350,12 +365,14 @@ def generate(word, context, deck, lang):
         raise RuntimeError("La variable d'environnement GROQ_API_KEY n'est pas définie.")
     a, b = DECKS[deck]["langs"]
     context_line = f"Contexte ou sens voulu : {context}" if context else ""
+    spelling_line = SPELLING_LINE if lang == "pl" or (lang == "auto" and "pl" in (a, b)) else ""
     if lang == "auto":
         prompt = PROMPT_AUTO.format(word=word, context_line=context_line, a=LANGS[a][0], b=LANGS[b][0],
-                                    a_code=a, b_code=b)
+                                    a_code=a, b_code=b, spelling_line=spelling_line)
     else:
         other = b if lang == a else a
-        prompt = PROMPT.format(word=word, context_line=context_line, src=LANGS[lang][0], dst=LANGS[other][0])
+        prompt = PROMPT.format(word=word, context_line=context_line, src=LANGS[lang][0], dst=LANGS[other][0],
+                               spelling_line=spelling_line)
     body = {
         "model": _model or GROQ_MODEL,
         "temperature": 0.7,
@@ -383,6 +400,7 @@ def generate(word, context, deck, lang):
         lang = LANG_ALIASES.get(str(result.get("lang", "")).strip().lower(), a)
         lang = lang if lang in (a, b) else a
     result["lang"] = lang
+    result["word"] = fix_polish_spelling(word, str(result.get("word", ""))) if lang == "pl" else word
     return result
 
 
@@ -418,8 +436,8 @@ def process_card(card_id):
             r = generate(row["word"], row["context"], deck_of(row["deck"]), row["lang"])
             with db() as conn:
                 conn.execute(
-                    "UPDATE cards SET sentence_fr=?, word_en=?, sentence_en=?, lang=? WHERE id=?",
-                    (r["sentence"].strip(), r["translation"].strip(), r["sentence_translation"].strip(),
+                    "UPDATE cards SET word=?, sentence_fr=?, word_en=?, sentence_en=?, lang=? WHERE id=?",
+                    (r["word"], r["sentence"].strip(), r["translation"].strip(), r["sentence_translation"].strip(),
                      r["lang"], card_id),
                 )
                 row = conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
