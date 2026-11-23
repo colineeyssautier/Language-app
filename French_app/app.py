@@ -166,6 +166,17 @@ def db():
     return DB()
 
 
+def storage_warning():
+    """Message si les mots risquent d'être perdus au redémarrage de l'app en ligne, sinon ""."""
+    if DATABASE_URL:
+        return ""
+    if os.environ.get("RENDER") or (os.environ.get("RAILWAY_ENVIRONMENT")
+                                    and not os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")):
+        return ("Attention : l'app en ligne n'a pas de base de données permanente (DATABASE_URL vide). "
+                "Les mots ajoutés seront effacés à chaque redémarrage ou mise en veille de l'app.")
+    return ""
+
+
 def is_duplicate(exc):
     return isinstance(exc, sqlite3.IntegrityError) or type(exc).__name__ == "UniqueViolation"
 
@@ -645,7 +656,13 @@ def pair_words(word_text, context_text=""):
     Le champ Contexte s'applique ligne par ligne s'il a autant de lignes que de mots,
     ou au mot unique s'il n'y en a qu'un. Les parenthèses sont prioritaires.
     """
-    entries = [split_word(line) for line in word_text.splitlines() if line.strip()]
+    entries, seen = [], set()
+    for line in word_text.splitlines():
+        # On enlève les puces ou numéros de liste éventuels : « - mot », « • mot », « 3. mot », « 3) mot ».
+        line = re.sub(r"^\s*(?:[-–—•*·]+|\d+[.)])\s+", "", line).strip()
+        if line and line.lower() not in seen:  # une seule carte par mot, même s'il est répété
+            seen.add(line.lower())
+            entries.append(split_word(line))
     ctx_lines = [c.strip() for c in (context_text or "").splitlines() if c.strip()]
     if len(entries) == 1:
         ctx_lines = [" ".join(ctx_lines)] if ctx_lines else []
@@ -794,7 +811,8 @@ STYLE = """
 body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#222}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.5rem;text-align:left;vertical-align:top}
 .err{color:#b00} a.btn,button{background:#2a5bd7;color:#fff;border:0;padding:.5rem 1rem;border-radius:6px;text-decoration:none;cursor:pointer;font:inherit}
-input,select{padding:.45rem;border:1px solid #bbb;border-radius:6px;font:inherit} form{margin:1rem 0}
+input,select,textarea{padding:.45rem;border:1px solid #bbb;border-radius:6px;font:inherit} form{margin:1rem 0}
+textarea{width:100%;max-width:420px;box-sizing:border-box;vertical-align:top;resize:vertical}
 button.danger{background:#b3261e} button.x{background:none;color:#999;padding:.2rem .4rem;font-size:1.1rem}
 button.light{background:#eef2fb;color:#2a5bd7}
 tr.exported td{color:#888} .small{color:#666;font-size:.9rem} .tag{font-size:.75rem;color:#2e7d32}
@@ -808,8 +826,9 @@ a.cards{background:#2e7d32}
 
 PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mes mots</title><style>{style}</style></head><body>
+<title>Mes mots</title>{refresh}<style>{style}</style></head><body>
 <h1>Mes mots</h1>
+{warning}
 <nav class=tabs>{tabs}</nav>
 <p>{download} <a class="btn cards" href="/cartes?deck={deck}">Réviser en flashcards</a></p>
 <p class=small>{count} carte(s) dans ce paquet, dont {exported} déjà téléchargée(s).
@@ -817,7 +836,7 @@ PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <a href="/export.csv?deck={deck}">CSV</a> · <a href="/audio.zip?deck={deck}">fichiers audio et images (.zip)</a></p>
 <form method="post" action="/add">
 <input type="hidden" name="deck" value="{deck}">
-<input name="word" placeholder="{placeholder}" required>
+<textarea name="word" rows="4" placeholder="{placeholder}&#10;(un mot par ligne : chaque ligne = une carte)" required></textarea>
 {lang_select}
 <input name="context" placeholder="contexte (optionnel)">
 <button>Ajouter</button></form>
@@ -881,7 +900,10 @@ def render_home(deck):
                      f'<button class=light>Ajouter les images manquantes ({missing})</button></form>'
                      if images_enabled() and missing else "")
     placeholder = "mot" if pair else f"mot en {LANGS[a][0]}"
-    return PAGE.format(style=STYLE, tabs=tabs, deck=deck, download=download, count=len(done),
+    warning = f"<p class=err><b>{e(storage_warning())}</b></p>" if storage_warning() else ""
+    # Tant que des mots sont en cours de génération, la page se recharge toute seule.
+    refresh = '<meta http-equiv="refresh" content="4">' if any(r["status"] == "pending" for r in rows) else ""
+    return PAGE.format(style=STYLE, refresh=refresh, warning=warning, tabs=tabs, deck=deck, download=download, count=len(done),
                        exported=exported, rows="".join(trs), lang_select=lang_select,
                        images_button=images_button, placeholder=placeholder)
 
@@ -1224,8 +1246,10 @@ class Handler(BaseHTTPRequestHandler):
             word = form.get("word", [""])[0]
             if word.strip():
                 lang = lang_of(form.get("lang", [""])[0], deck)
-                for w, ctx in pair_words(word, form.get("context", [""])[0]):
-                    add_word(w, ctx, deck, lang)
+                ids = [add_word(w, ctx, deck, lang, process=False)
+                       for w, ctx in pair_words(word, form.get("context", [""])[0])]
+                # Une carte par ligne, générées en arrière-plan pour ne pas bloquer la page.
+                in_background(process_many, [i for i in ids if i])
         elif path == "/delete":
             if card_id.isdigit():
                 delete_cards([int(card_id)])
@@ -1252,6 +1276,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if DATABASE_URL and not DATABASE_URL.startswith(("postgres://", "postgresql://")):
+        raise SystemExit("DATABASE_URL doit être l'adresse Postgres de Supabase (postgresql://…), pas l'adresse "
+                         "https://…supabase.co/rest/v1/. Supabase : bouton Connect → Session pooler.")
     if sys.argv[1:] == ["copier"]:
         copy_local_to_online()
         raise SystemExit
@@ -1263,5 +1290,7 @@ if __name__ == "__main__":
     print("Images IA :", IMAGE_PROVIDER if images_enabled() else "désactivées",
           "(automatiques)" if IMAGES_AUTO and images_enabled() else "")
     print("Base :", "Supabase (en ligne)" if DATABASE_URL else DB_PATH)
+    if storage_warning():
+        print("⚠️ ", storage_warning())
     print(f"App lancée sur http://localhost:{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
