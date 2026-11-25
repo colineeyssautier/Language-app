@@ -56,7 +56,59 @@ def load_env_file():
 
 load_env_file()
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
+def http_detail(e):
+    """Texte de la réponse d'erreur HTTP (lu une seule fois, puis gardé en mémoire)."""
+    if not hasattr(e, "_detail"):
+        try:
+            e._detail = e.read().decode(errors="replace")
+        except Exception:
+            e._detail = ""
+    return e._detail
+
+
+class KeyRing:
+    """Plusieurs clés pour un même service, utilisées l'une après l'autre (rotation).
+
+    Dans le .env : GROQ_API_KEY=cle1,cle2  ou  GROQ_API_KEY=cle1 puis GROQ_API_KEY_2=cle2, _3…
+    Quand une clé n'a plus de crédit (ou atteint sa limite), on passe à la suivante et on y reste.
+    """
+    # 401/403 : clé invalide ou crédit épuisé (ElevenLabs), 402 : paiement requis, 429 : quota/limite.
+    QUOTA_CODES = (401, 402, 403, 429)
+
+    def __init__(self, name):
+        raw = [os.environ.get(name, "")] + [os.environ.get(f"{name}_{i}", "") for i in range(2, 51)]
+        keys = [k.strip() for r in raw for k in r.split(",") if k.strip()]
+        self.name = name
+        self.keys = list(dict.fromkeys(keys))  # sans doublons, dans l'ordre
+        self.index = 0
+        self.lock = threading.Lock()
+
+    def __bool__(self):
+        return bool(self.keys)
+
+    def call(self, fn):
+        """Appelle fn(clé). Si la clé est épuisée, réessaie avec les suivantes ; sinon l'erreur remonte."""
+        if not self.keys:
+            raise RuntimeError(f"La variable d'environnement {self.name} n'est pas définie.")
+        with self.lock:
+            start = self.index
+        for step in range(len(self.keys)):
+            i = (start + step) % len(self.keys)
+            try:
+                result = fn(self.keys[i])
+            except urllib.error.HTTPError as e:
+                if e.code not in self.QUOTA_CODES or step == len(self.keys) - 1:
+                    raise
+                nxt = (i + 1) % len(self.keys)
+                print(f"{self.name} n°{i + 1} épuisée ({e.code}), passage à la clé n°{nxt + 1}.")
+                continue
+            with self.lock:
+                self.index = i
+            return result
+
+
+GROQ_API_KEY = KeyRing("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 TALLY_SIGNING_SECRET = os.environ.get("TALLY_SIGNING_SECRET", "")
 # Mot de passe des pages web (indispensable une fois l'app en ligne). Vide = pas de mot de passe.
@@ -67,14 +119,14 @@ DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.abspath
 PORT = int(os.environ.get("PORT", "8000"))
 # Voix ElevenLabs (optionnel : sans clé, les cartes n'ont simplement pas d'audio).
 # ELEVENLABS_VOICE_ID_DE, _EN, _PL… permettent une autre voix pour une langue donnée.
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_API_KEY = KeyRing("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "")
 ELEVENLABS_MODEL = os.environ.get("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(os.path.dirname(DB_PATH), "audio"))
 # Images IA : "pollinations" (gratuit, sans clé), "openai" (OPENAI_API_KEY) ou "aucun".
 IMAGE_PROVIDER = os.environ.get("IMAGE_PROVIDER", "pollinations").strip().lower()
 IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_API_KEY = KeyRing("OPENAI_API_KEY")
 POLLINATIONS_API_KEY = os.environ.get("POLLINATIONS_API_KEY", "")
 # IMAGES_AUTO=1 : une image pour chaque nouveau mot. Sinon, bouton 🖼 sur la page.
 IMAGES_AUTO = os.environ.get("IMAGES_AUTO", "").strip().lower() in ("1", "true", "oui", "yes")
@@ -342,17 +394,19 @@ _model = None
 
 
 def groq_request(path, body=None):
-    req = urllib.request.Request(
-        "https://api.groq.com/openai/v1" + path,
-        data=json.dumps(body).encode() if body is not None else None,
-        headers={
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json",
-            "User-Agent": "language-anki-app/1.0",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.load(resp)
+    def send(key):
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1" + path,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "User-Agent": "language-anki-app/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)
+    return GROQ_API_KEY.call(send)
 
 
 def pick_available_model():
@@ -372,8 +426,6 @@ def pick_available_model():
 def generate(word, context, deck, lang):
     """Renvoie {"lang", "translation", "sentence", "sentence_translation"}."""
     global _model
-    if not GROQ_API_KEY:
-        raise RuntimeError("La variable d'environnement GROQ_API_KEY n'est pas définie.")
     a, b = DECKS[deck]["langs"]
     context_line = f"Contexte ou sens voulu : {context}" if context else ""
     spelling_line = SPELLING_LINE if lang == "pl" or (lang == "auto" and "pl" in (a, b)) else ""
@@ -394,7 +446,7 @@ def generate(word, context, deck, lang):
         try:
             data = groq_request("/chat/completions", body)
         except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")
+            detail = http_detail(e)
             if e.code not in (400, 404) or "model" not in detail:
                 raise RuntimeError(f"Groq a répondu {e.code} : {detail[:300]}")
             # Le modèle n'existe plus : on en choisit un autre automatiquement.
@@ -402,7 +454,7 @@ def generate(word, context, deck, lang):
             print(f"Modèle Groq « {GROQ_MODEL} » indisponible, utilisation de « {_model} ».")
             data = groq_request("/chat/completions", body)
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Groq a répondu {e.code} : {e.read().decode(errors='replace')[:300]}")
+        raise RuntimeError(f"Groq a répondu {e.code} : {http_detail(e)[:300]}")
     result = json.loads(data["choices"][0]["message"]["content"])
     for key in ("translation", "sentence", "sentence_translation"):
         if not str(result.get(key, "")).strip():
@@ -482,46 +534,47 @@ def process_many(ids):
 
 # ---------- ElevenLabs ----------
 
-_voice_id = None
+_voice_ids = {}  # voix choisie automatiquement, par clé (chaque compte a ses voix)
 
 
-def elevenlabs_request(path, body=None):
+def elevenlabs_request(key, path, body=None):
     req = urllib.request.Request(
         "https://api.elevenlabs.io/v1" + path,
         data=json.dumps(body).encode() if body is not None else None,
-        headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json",
+        headers={"xi-api-key": key, "Content-Type": "application/json",
                  "User-Agent": "language-anki-app/1.0"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"ElevenLabs a répondu {e.code} : {e.read().decode(errors='replace')[:300]}")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
 
 
-def voice_id(lang):
+def voice_id(lang, key):
     """ELEVENLABS_VOICE_ID_<LANGUE> ou ELEVENLABS_VOICE_ID si définie, sinon une voix française du compte."""
-    global _voice_id
     specific = os.environ.get(f"ELEVENLABS_VOICE_ID_{lang.upper()}", "")
     if specific or ELEVENLABS_VOICE_ID:
         return specific or ELEVENLABS_VOICE_ID
-    if not _voice_id:
-        voices = json.loads(elevenlabs_request("/voices")).get("voices", [])
+    if key not in _voice_ids:
+        voices = json.loads(elevenlabs_request(key, "/voices")).get("voices", [])
         if not voices:
             raise RuntimeError("Aucune voix trouvée sur ton compte ElevenLabs.")
         def is_french(v):
             text = (v.get("name", "") + " " + json.dumps(v.get("labels") or {})).lower()
             return "french" in text or "fran" in text
-        _voice_id = next((v for v in voices if is_french(v)), voices[0])["voice_id"]
-    return _voice_id
+        _voice_ids[key] = next((v for v in voices if is_french(v)), voices[0])["voice_id"]
+    return _voice_ids[key]
 
 
 def save_audio(text, lang, filename):
     """Lit le texte avec ElevenLabs (modèle multilingue) et enregistre le mp3. Renvoie le nom du fichier."""
-    audio = elevenlabs_request(
-        f"/text-to-speech/{voice_id(lang)}?output_format=mp3_44100_128",
-        {"text": text, "model_id": ELEVENLABS_MODEL},
-    )
+    def speak(key):
+        return elevenlabs_request(
+            key, f"/text-to-speech/{voice_id(lang, key)}?output_format=mp3_44100_128",
+            {"text": text, "model_id": ELEVENLABS_MODEL},
+        )
+    try:
+        audio = ELEVENLABS_API_KEY.call(speak)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"ElevenLabs a répondu {e.code} : {http_detail(e)[:300]}")
     put_media(filename, audio)
     return filename
 
@@ -547,17 +600,19 @@ def image_prompt(row):
 def fetch_image(prompt):
     """Renvoie les octets de l'image générée."""
     if IMAGE_PROVIDER == "openai":
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/images/generations",
-            data=json.dumps({"model": IMAGE_MODEL or "gpt-image-1-mini", "prompt": prompt,
-                             "size": "1024x1024", "quality": "low", "n": 1}).encode(),
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        )
-        try:
+        def draw(key):
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/images/generations",
+                data=json.dumps({"model": IMAGE_MODEL or "gpt-image-1-mini", "prompt": prompt,
+                                 "size": "1024x1024", "quality": "low", "n": 1}).encode(),
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            )
             with urllib.request.urlopen(req, timeout=180) as resp:
-                item = json.load(resp)["data"][0]
+                return json.load(resp)["data"][0]
+        try:
+            item = OPENAI_API_KEY.call(draw)
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"OpenAI a répondu {e.code} : {e.read().decode(errors='replace')[:300]}")
+            raise RuntimeError(f"OpenAI a répondu {e.code} : {http_detail(e)[:300]}")
         if item.get("b64_json"):
             return base64.b64decode(item["b64_json"])
         with urllib.request.urlopen(item["url"], timeout=120) as resp:
@@ -836,7 +891,8 @@ PAGE = """<!doctype html><html lang="fr"><head><meta charset="utf-8">
 <a href="/export.csv?deck={deck}">CSV</a> · <a href="/audio.zip?deck={deck}">fichiers audio et images (.zip)</a></p>
 <form method="post" action="/add">
 <input type="hidden" name="deck" value="{deck}">
-<textarea name="word" rows="4" placeholder="{placeholder}&#10;(un mot par ligne : chaque ligne = une carte)" required></textarea>
+<textarea name="word" rows="4" autofocus placeholder="{placeholder}&#10;(Entrée = envoyer · Maj+Entrée = nouvelle ligne : chaque ligne = une carte)" required
+ onkeydown="if (event.key === 'Enter' &amp;&amp; !event.shiftKey &amp;&amp; !event.isComposing) {{ event.preventDefault(); this.form.requestSubmit(); }}"></textarea>
 {lang_select}
 <input name="context" placeholder="contexte (optionnel)">
 <button>Ajouter</button></form>
